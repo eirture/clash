@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Dreamacro/clash/component/dialer"
 	"github.com/Dreamacro/clash/component/resolver"
@@ -17,6 +18,7 @@ import (
 	"github.com/Dreamacro/clash/transport/socks5"
 	"github.com/Dreamacro/clash/transport/vmess"
 
+	"github.com/quic-go/quic-go"
 	"golang.org/x/net/http2"
 )
 
@@ -31,6 +33,8 @@ type Vmess struct {
 	gunTLSConfig *tls.Config
 	gunConfig    *gun.Config
 	transport    *http2.Transport
+
+	quicTransport *vmess.QuicTransport
 }
 
 type VmessOption struct {
@@ -50,6 +54,7 @@ type VmessOption struct {
 	HTTP2Opts      HTTP2Options `proxy:"h2-opts,omitempty"`
 	GrpcOpts       GrpcOptions  `proxy:"grpc-opts,omitempty"`
 	WSOpts         WSOptions    `proxy:"ws-opts,omitempty"`
+	QUICOpts       QUICOption   `proxy:"quic-opts,omitempty"`
 }
 
 type HTTPOptions struct {
@@ -72,6 +77,12 @@ type WSOptions struct {
 	Headers             map[string]string `proxy:"headers,omitempty"`
 	MaxEarlyData        int               `proxy:"max-early-data,omitempty"`
 	EarlyDataHeaderName string            `proxy:"early-data-header-name,omitempty"`
+}
+
+type QUICOption struct {
+	Security string            `proxy:"security,omitempty"`
+	Key      string            `proxy:"key,omitempty"`
+	Header   map[string]string `proxy:"header,omitempty"`
 }
 
 // StreamConn implements C.ProxyAdapter
@@ -206,6 +217,24 @@ func (v *Vmess) DialContext(ctx context.Context, metadata *C.Metadata, opts ...d
 
 		return NewConn(c, v), nil
 	}
+	if v.option.Network == "quic" {
+		stream, conn, err := v.quicTransport.OpenStream(v.addr)
+		if err != nil {
+			return nil, err
+		}
+		c, err := vmess.StreamQuicConn(stream, conn.LocalAddr(), conn.RemoteAddr())
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			safeConnClose(c, err)
+		}()
+		c, err = v.client.StreamConn(c, parseVmessAddr(metadata))
+		if err != nil {
+			return nil, err
+		}
+		return NewConn(c, v), nil
+	}
 
 	c, err := dialer.DialContext(ctx, "tcp", v.addr, v.Base.DialOptions(opts...)...)
 	if err != nil {
@@ -278,7 +307,7 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 	}
 
 	switch option.Network {
-	case "h2", "grpc":
+	case "h2", "grpc", "quic":
 		if !option.TLS {
 			return nil, fmt.Errorf("TLS must be true with h2/grpc network")
 		}
@@ -330,6 +359,19 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 		v.gunTLSConfig = tlsConfig
 		v.gunConfig = gunConfig
 		v.transport = gun.NewHTTP2Client(dialFn, tlsConfig)
+	case "quic":
+		tlsConfig := &tls.Config{
+			ServerName:         v.option.ServerName,
+			InsecureSkipVerify: v.option.SkipCertVerify,
+			NextProtos:         []string{"http/1.1"},
+		}
+		quicCfg := &quic.Config{
+			ConnectionIDLength:   12,
+			HandshakeIdleTimeout: time.Second * 8,
+			MaxIdleTimeout:       time.Second * 30,
+			KeepAlivePeriod:      time.Second * 15,
+		}
+		v.quicTransport = vmess.NewQuicTransport(tlsConfig, quicCfg)
 	}
 
 	return v, nil
